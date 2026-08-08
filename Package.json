@@ -1,0 +1,15 @@
+{
+  "name": "royalex-relay-server",
+  "version": "1.0.0",
+  "description": "Real-time relay server for ROYALE X: real friends, real matchmaking, real player sync.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.16.0"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
