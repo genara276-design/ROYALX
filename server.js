@@ -231,17 +231,17 @@ wss.on("connection", (ws)=>{
     // ---------------- leaderboard ----------------
     if(msg.type==="leaderboardSubmit"){
       const i = DATA.leaderboard.findIndex(e=>e.id===msg.id);
-      const entry = { id: msg.id, name: msg.name, score: msg.score||0, kills: msg.kills||0, wins: msg.wins||0 };
-      if(i>=0){ if(entry.score>DATA.leaderboard[i].score) DATA.leaderboard[i]=entry; }
+      const entry = { id: msg.id, name: msg.name, rankPoints: msg.rankPoints||0, kills: msg.kills||0, wins: msg.wins||0 };
+      if(i>=0){ if(entry.rankPoints>DATA.leaderboard[i].rankPoints) DATA.leaderboard[i]=entry; }
       else DATA.leaderboard.push(entry);
-      DATA.leaderboard.sort((a,b)=>b.score-a.score);
+      DATA.leaderboard.sort((a,b)=>b.rankPoints-a.rankPoints);
       DATA.leaderboard = DATA.leaderboard.slice(0,100);
       persistData();
-      broadcastAll({ type:"leaderboardUpdate", entries: DATA.leaderboard.slice(0,50) });
+      broadcastAll({ type:"leaderboardUpdate", board: DATA.leaderboard.slice(0,50) });
       return;
     }
     if(msg.type==="leaderboardRequest"){
-      send(ws, { type:"leaderboardUpdate", entries: DATA.leaderboard.slice(0,50) });
+      send(ws, { type:"leaderboardUpdate", board: DATA.leaderboard.slice(0,50) });
       return;
     }
 
@@ -316,7 +316,7 @@ function tryFormMatch(){
   players.forEach(p=>{
     const c = clientsById.get(p.id);
     if(c) c.room = roomId;
-    sendToId(p.id, { type:"matchStart", roomId, players });
+    sendToId(p.id, { type:"matchStart", roomId, players, npcCount: Math.max(24, 100-players.length) });
   });
 }
 setInterval(tryFormMatch, 2000);
@@ -401,3 +401,4 @@ function handleAdminAction(msg, me){
     }
   }
 }
+
