@@ -1,390 +1,403 @@
 /**
- * ROYALE X — Multiplayer Relay Server
- * ------------------------------------------------------------------
- * A small, dependency-light Node.js WebSocket server that gives the
- * game real online features:
- *   - persistent player profiles (name + 7-digit ID)
- *   - real friend requests / friend lists with live online status
- *   - real matchmaking (queues actual connected players together)
- *   - real-time position/action sync between real players in a match
- *   - a global lobby chat between real connected players
- *   - a server-authenticated admin system (coins, bans, maintenance
- *     mode, market price overrides)
+ * Royale X relay server
+ * ----------------------------------------------------------------------
+ * A single-file WebSocket relay implementing every message type the
+ * royale-x.html client sends/expects. Deploy this on Render (or any
+ * Node host) as a "Web Service", then point the client's SERVER_URL at
+ * its wss:// address.
  *
- * NPCs are NOT synced over the network — each player's client still
- * simulates its own NPCs locally (same as the offline build). Only
- * real human players are relayed through this server.
+ * Run locally:   npm install ws && node server.js
+ * Render:        Build command: npm install   Start command: node server.js
  *
- * Requirements: Node.js 18+, and the "ws" package:
- *     npm install ws
- *
- * Run:
- *     node server.js
- * By default it listens on process.env.PORT or 8080.
- * ------------------------------------------------------------------
- * ADMIN PASSWORD — READ THIS
- * The admin password is set via the ADMIN_KEY environment variable on
- * whatever host you deploy this to (Render/Railway/Fly all have a
- * place to set env vars in their dashboard). If you don't set one, it
- * defaults to "1403" as requested — but that default is public
- * (it's written in this very file), so anyone who reads this source
- * knows it. Set your own ADMIN_KEY before going live with real
- * players, or anyone could grant themselves coins, ban people, or
- * shut the game down. This is the ONLY place the real password is
- * compared — it is never sent to or stored in the game client, so
- * changing it here (and only here) is all you need to do.
- * ------------------------------------------------------------------
- * HOSTING
- * This process must be deployed somewhere with a public URL before
- * the game client can use it (Claude cannot host it for you). Any
- * Node-friendly host works, e.g. Render.com, Railway.app, Fly.io, or
- * your own VPS. Once deployed you'll get a URL like
- * wss://your-app.onrender.com — paste that into SERVER_URL near the
- * top of index.html's <script>.
- * ------------------------------------------------------------------
+ * Data (friends / leaderboard / admin state) is persisted to a local
+ * JSON file (data.json) so it survives restarts. On Render's free tier
+ * the filesystem is wiped on redeploy, but survives normal restarts —
+ * good enough for a game like this without a real database.
+ * ----------------------------------------------------------------------
  */
-
-const http = require("http");
+const WebSocket = require("ws");
 const fs = require("fs");
-const path = require("path");
-const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
 const PORT = process.env.PORT || 8080;
-const ADMIN_KEY = process.env.ADMIN_KEY || "1403"; // change this via env var for real deployments
-const DATA_FILE = path.join(__dirname, "royalex-server-data.json");
-const MATCH_SIZE_TARGET = 50;        // total match "slots" (real players + client-simulated NPCs)
-const MATCHMAKING_WINDOW_MS = 15000; // matches the client's 15s "Finding Match" screen
-const CHAT_HISTORY_MAX = 50;
+const ADMIN_KEY = process.env.ADMIN_KEY || "letmein123"; // change this in Render's env vars!
+const DATA_FILE = __dirname + "/data.json";
 
-/* ---------------- persistence (flat JSON file — simple by design) ---------------- */
+// ---------------------------------------------------------------------
+// Persistence
+// ---------------------------------------------------------------------
 function loadData(){
   try{ return JSON.parse(fs.readFileSync(DATA_FILE, "utf8")); }
   catch(e){
     return {
-      profiles: {},       // id -> {name}
-      friends: {},        // id -> [ids]
-      banned: {},         // id -> {reason, at}
-      pendingCoins: {},   // id -> total coins to deliver next time they connect
-      priceOverrides: {}, // itemId -> new price
-      maintenance: { active:false, until:0, message:"" },
-      chatHistory: []      // [{id,name,text,at}]
+      friends: {},        // playerId -> [playerId, ...]
+      leaderboard: [],     // [{id,name,score,kills,wins}, ...]
+      banned: [],           // [playerId, ...]
+      season: 1,
+      seasonFrames: [{ season:1, id:"frame_season1", mid:200, name:"1-ci Sezon Çempionu", color:"#ffcf4d", glow:"#fff2b0" }]
     };
   }
 }
-function saveData(data){
-  try{ fs.writeFileSync(DATA_FILE, JSON.stringify(data)); }catch(e){ console.error("save failed", e); }
-}
-let DB = loadData();
-DB.banned = DB.banned || {};
-DB.pendingCoins = DB.pendingCoins || {};
-DB.priceOverrides = DB.priceOverrides || {};
-DB.maintenance = DB.maintenance || { active:false, until:0, message:"" };
-DB.chatHistory = DB.chatHistory || [];
-
-/* ---------------- live state ---------------- */
-const clients = new Map();     // id -> { ws, name, isAdmin }
-const queue = [];              // ids waiting for a match
-let queueTimer = null;
-const rooms = new Map();       // roomId -> Set of ids
-const playerRoom = new Map();  // id -> roomId
-let maintenanceTimer = null;
-
-function send(ws, obj){ try{ ws.send(JSON.stringify(obj)); }catch(e){} }
-function broadcastAll(obj){ clients.forEach(entry=>send(entry.ws, obj)); }
-function broadcastFriendsUpdate(id){
-  const entry = clients.get(id);
-  if(!entry) return;
-  const friendIds = DB.friends[id] || [];
-  const list = friendIds.map(fid=>({
-    id: fid,
-    name: (DB.profiles[fid]||{}).name || "Player",
-    status: clients.has(fid) ? "online" : "offline"
-  }));
-  send(entry.ws, { type:"friendsUpdate", friends:list });
-}
-function notifyFriendsOfStatusChange(id){
-  const friendIds = DB.friends[id] || [];
-  friendIds.forEach(fid=>{ if(clients.has(fid)) broadcastFriendsUpdate(fid); });
-}
-function currentMaintenancePayload(){
-  const active = DB.maintenance.active && DB.maintenance.until > Date.now();
-  return { type:"maintenanceUpdate", active, until: DB.maintenance.until, message: DB.maintenance.message };
-}
-function scheduleMaintenanceEnd(){
-  if(maintenanceTimer) clearTimeout(maintenanceTimer);
-  if(!DB.maintenance.active) return;
-  const msLeft = DB.maintenance.until - Date.now();
-  if(msLeft<=0){ endMaintenance(); return; }
-  maintenanceTimer = setTimeout(endMaintenance, msLeft);
-}
-function endMaintenance(){
-  DB.maintenance = { active:false, until:0, message:"" };
-  saveData(DB);
-  broadcastAll(currentMaintenancePayload());
+let DATA = loadData();
+let saveTimer = null;
+function persistData(){
+  clearTimeout(saveTimer);
+  saveTimer = setTimeout(()=>{
+    try{ fs.writeFileSync(DATA_FILE, JSON.stringify(DATA)); }catch(e){ console.error("save failed", e); }
+  }, 500);
 }
 
-/* ---------------- matchmaking ---------------- */
-function broadcastQueueUpdate(){
-  queue.forEach(id=>{
-    const entry = clients.get(id);
-    if(entry) send(entry.ws, { type:"queueUpdate", realPlayers: queue.length, target: MATCH_SIZE_TARGET });
-  });
+// ---------------------------------------------------------------------
+// In-memory runtime state
+// ---------------------------------------------------------------------
+const clientsById = new Map();   // playerId -> { ws, id, name, room, isAdmin }
+const pendingFriendReqs = new Map(); // requestId -> { fromId, targetId }
+const pendingSquadInvites = new Map(); // requestId -> { fromId, targetId }
+const queue = [];                // [{ id, squad:[ids] }]
+const rooms = new Map();         // roomId -> { players: Set<playerId> }
+const chatHistory = [];          // last 50 { name, text, ts }
+let maintenance = { enabled:false, minutes:0, message:"" };
+let marketOverrides = {};        // mid -> { price, discountPrice, saleEndsAt, enabled }
+let eventWarningText = "";
+
+function uid(){ return crypto.randomBytes(8).toString("hex"); }
+function send(ws, obj){ if(ws && ws.readyState===1) try{ ws.send(JSON.stringify(obj)); }catch(e){} }
+function sendToId(id, obj){ const c = clientsById.get(id); if(c) send(c.ws, obj); }
+function broadcastAll(obj, exceptId){
+  clientsById.forEach((c, id)=>{ if(id!==exceptId) send(c.ws, obj); });
 }
-function startMatchmakingWindowIfNeeded(){
-  if(queueTimer) return;
-  queueTimer = setTimeout(()=>{
-    queueTimer = null;
-    formMatchFromQueue();
-  }, MATCHMAKING_WINDOW_MS);
+function broadcastRoom(roomId, obj, exceptId){
+  const room = rooms.get(roomId);
+  if(!room) return;
+  room.players.forEach(id=>{ if(id!==exceptId) sendToId(id, obj); });
 }
-function formMatchFromQueue(){
-  if(queue.length===0) return;
-  const roomId = "room_"+Date.now()+"_"+Math.floor(Math.random()*1e6);
-  const members = queue.splice(0, queue.length); // everyone currently queued joins the same room
-  const npcCount = Math.max(0, MATCH_SIZE_TARGET - members.length);
-  const roster = members.map(id=>({ id, name:(DB.profiles[id]||{}).name || "Player" }));
-  rooms.set(roomId, new Set(members));
-  members.forEach(id=>{
-    playerRoom.set(id, roomId);
-    const entry = clients.get(id);
-    if(entry) send(entry.ws, { type:"matchStart", roomId, players: roster, npcCount });
-  });
+function friendsOf(id){ return DATA.friends[id] || []; }
+function areFriends(a,b){ return friendsOf(a).includes(b); }
+function friendsUpdatePayload(id){
+  return {
+    type: "friendsUpdate",
+    friends: friendsOf(id).map(fid=>{
+      const c = clientsById.get(fid);
+      return { id: fid, name: c ? c.name : fid, status: c ? "online" : "offline" };
+    })
+  };
 }
 
-/* ---------------- server setup ---------------- */
-const httpServer = http.createServer((req,res)=>{
-  res.writeHead(200, {"Content-Type":"text/plain"});
-  res.end("ROYALE X relay server is running.\n");
-});
-const wss = new WebSocketServer({ server: httpServer });
+const wss = new WebSocket.Server({ port: PORT });
+console.log("Royale X relay listening on port " + PORT);
 
 wss.on("connection", (ws)=>{
-  let myId = null;
+  let me = null; // set once "hello" arrives
 
   ws.on("message", (raw)=>{
     let msg;
     try{ msg = JSON.parse(raw); }catch(e){ return; }
+    if(!msg || typeof msg.type!=="string") return;
 
-    if(msg.type === "hello"){
-      const candidateId = String(msg.id||"").slice(0,7);
-      const name = String(msg.name||"Player").slice(0,16);
-      if(!/^\d{7}$/.test(candidateId)) return;
-      if(DB.banned[candidateId]){
-        send(ws, { type:"banned", reason: DB.banned[candidateId].reason||"" });
-        ws.close();
-        return;
-      }
-      myId = candidateId;
-      clients.set(myId, { ws, name, isAdmin:false });
-      DB.profiles[myId] = { name };
-      if(!DB.friends[myId]) DB.friends[myId] = [];
-      saveData(DB);
-      send(ws, { type:"helloAck", id: myId });
-      send(ws, currentMaintenancePayload());
-      send(ws, { type:"priceOverrides", overrides: DB.priceOverrides });
-      send(ws, { type:"chatHistory", messages: DB.chatHistory.slice(-CHAT_HISTORY_MAX) });
-      // deliver any coins an admin granted while this player was offline
-      if(DB.pendingCoins[myId]){
-        send(ws, { type:"coinGrant", amount: DB.pendingCoins[myId] });
-        delete DB.pendingCoins[myId];
-        saveData(DB);
-      }
-      broadcastFriendsUpdate(myId);
-      notifyFriendsOfStatusChange(myId);
+    // ---------------- hello ----------------
+    if(msg.type==="hello"){
+      if(!msg.id || !msg.name) return;
+      if(DATA.banned.includes(msg.id)){ send(ws, { type:"banned", reason:"Banned" }); ws.close(); return; }
+      me = { ws, id: msg.id, name: String(msg.name).slice(0,16), room:null, isAdmin:false };
+      clientsById.set(me.id, me);
+      send(ws, friendsUpdatePayload(me.id));
+      send(ws, { type:"chatHistory", messages: chatHistory });
+      send(ws, { type:"seasonUpdate", season: DATA.season, seasonFrames: DATA.seasonFrames });
+      if(maintenance.enabled) send(ws, { type:"maintenanceUpdate", ...maintenance });
+      if(eventWarningText) send(ws, { type:"eventWarning", text: eventWarningText });
+      send(ws, { type:"priceOverrides", overrides: marketOverrides });
+      // let this player's online friends know they've come online
+      friendsOf(me.id).forEach(fid=>{ if(clientsById.has(fid)) sendToId(fid, friendsUpdatePayload(fid)); });
       return;
     }
-    if(!myId) return; // must say hello first
+    if(!me) return; // everything below requires hello first
 
-    if(msg.type === "addFriend"){
-      const targetId = String(msg.targetId||"").slice(0,7);
-      if(!/^\d{7}$/.test(targetId) || targetId===myId) return;
-      if(!DB.profiles[targetId]){
-        send(ws, { type:"addFriendResult", ok:false, msg:"That ID hasn't been seen online yet." });
-        return;
-      }
-      DB.friends[myId] = DB.friends[myId] || [];
-      if(!DB.friends[myId].includes(targetId)) DB.friends[myId].push(targetId);
-      saveData(DB);
-      send(ws, { type:"addFriendResult", ok:true });
-      broadcastFriendsUpdate(myId);
+    // ---------------- friends ----------------
+    if(msg.type==="addFriend"){
+      const targetId = msg.targetId;
+      const target = clientsById.get(targetId);
+      if(!target){ send(ws, { type:"addFriendResult", ok:false, msg:"Player not online." }); return; }
+      if(areFriends(me.id, targetId)){ send(ws, { type:"addFriendResult", ok:false, msg:"Already friends." }); return; }
+      const requestId = uid();
+      pendingFriendReqs.set(requestId, { fromId: me.id, targetId });
+      send(target.ws, { type:"friendRequestIncoming", requestId, fromId: me.id, fromName: me.name });
+      send(ws, { type:"addFriendResult", ok:true, msg:"Request sent." });
       return;
     }
-
-    if(msg.type === "queue"){
-      if(!queue.includes(myId)) queue.push(myId);
-      broadcastQueueUpdate();
-      startMatchmakingWindowIfNeeded();
-      if(queue.length >= MATCH_SIZE_TARGET){
-        clearTimeout(queueTimer); queueTimer = null;
-        formMatchFromQueue();
+    if(msg.type==="friendRequestResponse"){
+      const req = pendingFriendReqs.get(msg.requestId);
+      pendingFriendReqs.delete(msg.requestId);
+      if(!req) return;
+      if(msg.accept){
+        DATA.friends[req.fromId] = DATA.friends[req.fromId] || [];
+        DATA.friends[req.targetId] = DATA.friends[req.targetId] || [];
+        if(!DATA.friends[req.fromId].includes(req.targetId)) DATA.friends[req.fromId].push(req.targetId);
+        if(!DATA.friends[req.targetId].includes(req.fromId)) DATA.friends[req.targetId].push(req.fromId);
+        persistData();
+        sendToId(req.fromId, friendsUpdatePayload(req.fromId));
+        sendToId(req.targetId, friendsUpdatePayload(req.targetId));
       }
       return;
     }
-    if(msg.type === "leaveQueue"){
-      const idx = queue.indexOf(myId);
+
+    // ---------------- public profile lookup (frame/rank, no privacy concern) ----------------
+    if(msg.type==="profileRequest"){
+      const target = clientsById.get(msg.targetId);
+      if(!target){ send(ws, { type:"profileResult", found:false }); return; }
+      send(target.ws, { type:"profileRequestIncoming", requesterId: me.id });
+      return;
+    }
+    if(msg.type==="profileResponse"){
+      sendToId(msg.requesterId, { type:"profileResult", found:true, id:msg.id, name:msg.name, rankTier:msg.rankTier, frame:msg.frame, icon:msg.icon });
+      return;
+    }
+
+    // ---------------- squad invites ----------------
+    if(msg.type==="squadInvite"){
+      const target = clientsById.get(msg.targetId);
+      if(!target) return;
+      const requestId = uid();
+      pendingSquadInvites.set(requestId, { fromId: me.id, targetId: msg.targetId });
+      send(target.ws, { type:"squadInviteIncoming", requestId, fromId: me.id, fromName: me.name });
+      return;
+    }
+    if(msg.type==="squadInviteResponse"){
+      const req = pendingSquadInvites.get(msg.requestId);
+      pendingSquadInvites.delete(msg.requestId);
+      if(!req) return;
+      sendToId(req.fromId, { type:"squadInviteResult", byId: req.targetId, accept: !!msg.accept });
+      return;
+    }
+
+    // ---------------- matchmaking ----------------
+    if(msg.type==="queue"){
+      if(queue.some(q=>q.id===me.id)) return;
+      queue.push({ id: me.id, squad: Array.isArray(msg.squad) ? msg.squad : [] });
+      tryFormMatch();
+      return;
+    }
+    if(msg.type==="leaveQueue"){
+      const idx = queue.findIndex(q=>q.id===me.id);
       if(idx>=0) queue.splice(idx,1);
-      broadcastQueueUpdate();
       return;
     }
-
-    if(msg.type === "hit"){
-      const roomId = playerRoom.get(myId);
-      if(!roomId) return;
-      const members = rooms.get(roomId);
-      if(!members || !members.has(msg.targetId)) return;
-      const target = clients.get(msg.targetId);
-      if(target) send(target.ws, { type:"peerHit", id: myId, dmg: msg.dmg });
-      return;
-    }
-
-    if(msg.type === "state" || msg.type === "shoot" || msg.type === "downed"){
-      const roomId = playerRoom.get(myId);
-      if(!roomId) return;
-      const members = rooms.get(roomId);
-      if(!members) return;
-      members.forEach(pid=>{
-        if(pid===myId) return;
-        const entry = clients.get(pid);
-        if(entry) send(entry.ws, Object.assign({}, msg, { type:"peer"+msg.type.charAt(0).toUpperCase()+msg.type.slice(1), id: myId }));
-      });
-      return;
-    }
-
-    if(msg.type === "leaveMatch"){
-      const roomId = playerRoom.get(myId);
-      if(roomId){
-        const members = rooms.get(roomId);
-        if(members){
-          members.delete(myId);
-          members.forEach(pid=>{ const e=clients.get(pid); if(e) send(e.ws,{type:"peerLeft", id:myId}); });
-          if(members.size===0) rooms.delete(roomId);
-        }
-        playerRoom.delete(myId);
+    if(msg.type==="leaveMatch"){
+      if(me.room){
+        const room = rooms.get(me.room);
+        if(room){ room.players.delete(me.id); broadcastRoom(me.room, { type:"peerLeft", id: me.id }, me.id); if(room.players.size===0) rooms.delete(me.room); }
+        me.room = null;
       }
       return;
     }
 
-    /* ---------------- global lobby chat ---------------- */
-    if(msg.type === "chatMessage"){
+    // ---------------- in-match relay ----------------
+    if(msg.type==="state"){
+      if(!me.room) return;
+      broadcastRoom(me.room, { type:"peerState", id:me.id, x:msg.x, y:msg.y, angle:msg.angle, hp:msg.hp, weapon:msg.weapon, skin:msg.skin }, me.id);
+      return;
+    }
+    if(msg.type==="shoot"){
+      if(!me.room) return;
+      broadcastRoom(me.room, { type:"peerShoot", id:me.id, x:msg.x, y:msg.y, angle:msg.angle }, me.id);
+      return;
+    }
+    if(msg.type==="hit"){
+      if(!me.room) return;
+      sendToId(msg.targetId, { type:"peerHit", id:me.id, dmg:msg.dmg });
+      return;
+    }
+    if(msg.type==="downed"){
+      if(!me.room) return;
+      broadcastRoom(me.room, { type:"peerDowned", id:me.id, killerId: msg.killerId||null }, null);
+      return;
+    }
+    if(msg.type==="skinKill"){
+      if(!me.room) return;
+      broadcastRoom(me.room, { type:"skinKill", skinId:msg.skinId, killer:msg.killer, x:msg.x, y:msg.y }, me.id);
+      return;
+    }
+
+    // ---------------- chat ----------------
+    if(msg.type==="chatMessage"){
       const text = String(msg.text||"").slice(0,200).trim();
       if(!text) return;
-      const entry = clients.get(myId);
-      const chatMsg = { id:myId, name:(entry&&entry.name)||"Player", text, at:Date.now() };
-      DB.chatHistory.push(chatMsg);
-      if(DB.chatHistory.length > CHAT_HISTORY_MAX) DB.chatHistory = DB.chatHistory.slice(-CHAT_HISTORY_MAX);
-      saveData(DB);
-      broadcastAll({ type:"chatMessage", message: chatMsg });
+      const entry = { name: me.name, text, ts: Date.now() };
+      chatHistory.push(entry);
+      if(chatHistory.length>50) chatHistory.shift();
+      broadcastAll({ type:"chatMessage", ...entry });
       return;
     }
 
-    /* ---------------- admin: authentication ---------------- */
-    if(msg.type === "adminAuth"){
-      const ok = String(msg.key||"") === ADMIN_KEY;
-      if(ok){ const entry = clients.get(myId); if(entry) entry.isAdmin = true; }
-      send(ws, { type:"adminAuthResult", ok });
+    // ---------------- leaderboard ----------------
+    if(msg.type==="leaderboardSubmit"){
+      const i = DATA.leaderboard.findIndex(e=>e.id===msg.id);
+      const entry = { id: msg.id, name: msg.name, score: msg.score||0, kills: msg.kills||0, wins: msg.wins||0 };
+      if(i>=0){ if(entry.score>DATA.leaderboard[i].score) DATA.leaderboard[i]=entry; }
+      else DATA.leaderboard.push(entry);
+      DATA.leaderboard.sort((a,b)=>b.score-a.score);
+      DATA.leaderboard = DATA.leaderboard.slice(0,100);
+      persistData();
+      broadcastAll({ type:"leaderboardUpdate", entries: DATA.leaderboard.slice(0,50) });
+      return;
+    }
+    if(msg.type==="leaderboardRequest"){
+      send(ws, { type:"leaderboardUpdate", entries: DATA.leaderboard.slice(0,50) });
       return;
     }
 
-    // everything below requires this connection to have authenticated as admin
-    const me = clients.get(myId);
-    if(!me || !me.isAdmin){
-      if(["adminGiveCoins","adminBan","adminUnban","adminMaintenance","adminSetPrice","adminClearPrice","adminBroadcast"].includes(msg.type)){
-        send(ws, { type:"adminActionResult", ok:false, msg:"Not authenticated as admin." });
-      }
+    // ---------------- admin ----------------
+    if(msg.type==="adminAuth"){
+      me.isAdmin = (msg.key === ADMIN_KEY);
+      send(ws, { type:"adminAuthResult", ok: me.isAdmin });
       return;
     }
-
-    if(msg.type === "adminGiveCoins"){
-      const targetId = String(msg.targetId||"").slice(0,7);
-      const amount = Math.max(0, Math.min(1000000, parseInt(msg.amount,10)||0));
-      if(!/^\d{7}$/.test(targetId) || amount<=0){ send(ws,{type:"adminActionResult",ok:false,msg:"Invalid target/amount."}); return; }
-      const target = clients.get(targetId);
-      if(target){ send(target.ws, { type:"coinGrant", amount }); }
-      else { DB.pendingCoins[targetId] = (DB.pendingCoins[targetId]||0) + amount; saveData(DB); }
-      send(ws, { type:"adminActionResult", ok:true, msg:"Granted "+amount+" coins to "+targetId+(target?" (delivered now)":" (will deliver on next login)") });
-      return;
-    }
-
-    if(msg.type === "adminBan"){
-      const targetId = String(msg.targetId||"").slice(0,7);
-      if(!/^\d{7}$/.test(targetId)){ send(ws,{type:"adminActionResult",ok:false,msg:"Invalid ID."}); return; }
-      DB.banned[targetId] = { reason: String(msg.reason||"").slice(0,140), at: Date.now() };
-      saveData(DB);
-      const target = clients.get(targetId);
-      if(target){ send(target.ws, { type:"banned", reason: DB.banned[targetId].reason }); target.ws.close(); }
-      send(ws, { type:"adminActionResult", ok:true, msg:targetId+" banned." });
-      return;
-    }
-    if(msg.type === "adminUnban"){
-      const targetId = String(msg.targetId||"").slice(0,7);
-      delete DB.banned[targetId];
-      saveData(DB);
-      send(ws, { type:"adminActionResult", ok:true, msg:targetId+" unbanned." });
-      return;
-    }
-
-    if(msg.type === "adminMaintenance"){
-      if(msg.enabled){
-        const minutes = Math.max(1, Math.min(1440, parseInt(msg.minutes,10)||10));
-        DB.maintenance = { active:true, until: Date.now()+minutes*60000, message: String(msg.message||"").slice(0,200) };
-        saveData(DB);
-        scheduleMaintenanceEnd();
-        broadcastAll(currentMaintenancePayload());
-        send(ws, { type:"adminActionResult", ok:true, msg:"Maintenance started for "+minutes+" minutes." });
-      } else {
-        endMaintenance();
-        send(ws, { type:"adminActionResult", ok:true, msg:"Maintenance ended." });
-      }
-      return;
-    }
-
-    if(msg.type === "adminSetPrice"){
-      const itemId = String(msg.itemId||"").slice(0,64);
-      const price = Math.max(0, Math.min(100000, parseInt(msg.price,10)||0));
-      if(!itemId){ send(ws,{type:"adminActionResult",ok:false,msg:"Missing item id."}); return; }
-      DB.priceOverrides[itemId] = price;
-      saveData(DB);
-      broadcastAll({ type:"priceOverrides", overrides: DB.priceOverrides });
-      send(ws, { type:"adminActionResult", ok:true, msg:itemId+" price set to "+price });
-      return;
-    }
-    if(msg.type === "adminClearPrice"){
-      const itemId = String(msg.itemId||"").slice(0,64);
-      delete DB.priceOverrides[itemId];
-      saveData(DB);
-      broadcastAll({ type:"priceOverrides", overrides: DB.priceOverrides });
-      send(ws, { type:"adminActionResult", ok:true, msg:itemId+" price override cleared." });
-      return;
-    }
-
-    if(msg.type === "adminBroadcast"){
-      const text = String(msg.text||"").slice(0,240);
-      if(!text) return;
-      broadcastAll({ type:"announcement", text });
-      send(ws, { type:"adminActionResult", ok:true, msg:"Announcement sent to "+clients.size+" online player(s)." });
+    if(msg.type.indexOf("admin")===0){
+      if(!me.isAdmin) return; // silently ignore admin actions from non-admins
+      handleAdminAction(msg, me);
       return;
     }
   });
 
   ws.on("close", ()=>{
-    if(!myId) return;
-    clients.delete(myId);
-    const idx = queue.indexOf(myId);
-    if(idx>=0) queue.splice(idx,1);
-    const roomId = playerRoom.get(myId);
-    if(roomId){
-      const members = rooms.get(roomId);
-      if(members){
-        members.delete(myId);
-        members.forEach(pid=>{ const e=clients.get(pid); if(e) send(e.ws,{type:"peerLeft", id:myId}); });
-      }
-      playerRoom.delete(myId);
+    if(!me) return;
+    clientsById.delete(me.id);
+    const qi = queue.findIndex(q=>q.id===me.id);
+    if(qi>=0) queue.splice(qi,1);
+    if(me.room){
+      const room = rooms.get(me.room);
+      if(room){ room.players.delete(me.id); broadcastRoom(me.room, { type:"peerLeft", id: me.id }, me.id); if(room.players.size===0) rooms.delete(me.room); }
     }
-    notifyFriendsOfStatusChange(myId);
+    friendsOf(me.id).forEach(fid=>{ if(clientsById.has(fid)) sendToId(fid, friendsUpdatePayload(fid)); });
   });
 });
 
-scheduleMaintenanceEnd();
-httpServer.listen(PORT, ()=>{
-  console.log("ROYALE X relay server listening on port "+PORT);
-});
+// ---------------------------------------------------------------------
+// Matchmaking: groups queued players into rooms, keeping squads together.
+// Real players relay peer-state to each other; each client fills the
+// rest of the 60-player lobby with local NPCs (existing client design).
+// ---------------------------------------------------------------------
+const MATCH_MAX_REAL = 8;
+const MATCH_MAX_WAIT_MS = 12000;
+let queueOpenedAt = null;
+
+function tryFormMatch(){
+  if(queue.length===0) return;
+  if(queueOpenedAt===null) queueOpenedAt = Date.now();
+  const waited = Date.now()-queueOpenedAt;
+  if(queue.length < 2 && waited < MATCH_MAX_WAIT_MS) return; // give a couple seconds for others to join
+
+  // squad-aware grouping: pull whole squads out together
+  const batch = [];
+  const used = new Set();
+  for(const q of queue){
+    if(used.has(q.id)) continue;
+    if(batch.length>=MATCH_MAX_REAL) break;
+    batch.push(q.id); used.add(q.id);
+    q.squad.forEach(sid=>{
+      if(!used.has(sid) && queue.some(x=>x.id===sid) && batch.length<MATCH_MAX_REAL){
+        batch.push(sid); used.add(sid);
+      }
+    });
+  }
+  if(batch.length===0) return;
+
+  // remove batched players from queue
+  for(let i=queue.length-1;i>=0;i--) if(used.has(queue[i].id)) queue.splice(i,1);
+  queueOpenedAt = queue.length ? Date.now() : null;
+
+  const roomId = uid();
+  const players = batch.map(id=>{
+    const c = clientsById.get(id);
+    return c ? { id, name: c.name } : null;
+  }).filter(Boolean);
+  if(players.length===0) return;
+
+  rooms.set(roomId, { players: new Set(players.map(p=>p.id)) });
+  players.forEach(p=>{
+    const c = clientsById.get(p.id);
+    if(c) c.room = roomId;
+    sendToId(p.id, { type:"matchStart", roomId, players });
+  });
+}
+setInterval(tryFormMatch, 2000);
+
+// ---------------------------------------------------------------------
+// Admin actions
+// ---------------------------------------------------------------------
+function handleAdminAction(msg, me){
+  switch(msg.type){
+    case "adminGiveCoins":
+      sendToId(msg.targetId, { type:"coinGrant", amount: msg.amount });
+      send(me.ws, { type:"adminActionResult", ok:true, msg:"Coins granted." });
+      break;
+    case "adminBan":
+      if(!DATA.banned.includes(msg.targetId)) DATA.banned.push(msg.targetId);
+      persistData();
+      sendToId(msg.targetId, { type:"banned", reason:"Banned by admin" });
+      const t = clientsById.get(msg.targetId); if(t) t.ws.close();
+      break;
+    case "adminUnban":
+      DATA.banned = DATA.banned.filter(id=>id!==msg.targetId);
+      persistData();
+      break;
+    case "adminMaintenance":
+      maintenance = { enabled: !!msg.enabled, minutes: msg.minutes||0, message: msg.message||"" };
+      broadcastAll({ type:"maintenanceUpdate", ...maintenance });
+      break;
+    case "adminSetPrice":
+      marketOverrides[msg.itemId] = Object.assign({}, marketOverrides[msg.itemId], { price: msg.price });
+      broadcastAll({ type:"priceOverrides", overrides: marketOverrides });
+      break;
+    case "adminClearPrice":
+      delete marketOverrides[msg.itemId];
+      broadcastAll({ type:"priceOverrides", overrides: marketOverrides });
+      break;
+    case "adminMarketOverride":
+      marketOverrides[msg.mid] = Object.assign({}, marketOverrides[msg.mid], { price: msg.price, discountPrice: msg.discountPrice });
+      broadcastAll({ type:"priceOverrides", overrides: marketOverrides });
+      break;
+    case "adminMarketSale":
+      marketOverrides[msg.mid] = Object.assign({}, marketOverrides[msg.mid], { saleEndsAt: Date.now()+msg.minutes*60000 });
+      broadcastAll({ type:"priceOverrides", overrides: marketOverrides });
+      break;
+    case "adminMarketToggle":
+      marketOverrides[msg.mid] = Object.assign({}, marketOverrides[msg.mid], { enabled: msg.enabled });
+      broadcastAll({ type:"priceOverrides", overrides: marketOverrides });
+      break;
+    case "adminBroadcast":
+      broadcastAll({ type:"announcement", text: msg.text });
+      break;
+    case "adminEventWarning":
+      eventWarningText = msg.text||"";
+      broadcastAll({ type:"eventWarning", text: eventWarningText });
+      break;
+    case "adminZombieForce":
+      broadcastAll({ type:"announcement", text: msg.action==="start" ? "🧟 Zombie event incoming!" : "" });
+      break;
+    case "adminWeatherTrigger":
+      broadcastAll({ type:"announcement", text: msg.weatherType ? ("🌩️ Weather event: "+msg.weatherType) : "" });
+      break;
+    case "adminChestSkinAdd":
+    case "adminChestSkinRemove":
+      // purely cosmetic pool, kept client-side in ADMIN_STATE (localStorage);
+      // nothing to relay server-side for these two
+      break;
+    case "adminEndSeason": {
+      // whoever's currently #1 on the leaderboard gets credit; the client
+      // grants the frame locally when it reaches top rank, this just
+      // rotates the shared season counter for everyone
+      DATA.season = msg.season;
+      persistData();
+      broadcastAll({ type:"seasonUpdate", season: DATA.season, seasonFrames: DATA.seasonFrames });
+      break;
+    }
+    case "adminNewSeason": {
+      DATA.season = msg.season;
+      const newFrame = { season: DATA.season, id:"frame_season"+DATA.season, mid: 200+(DATA.season-1), name: DATA.season+"-ci Sezon Çempionu", color:"#ffcf4d", glow:"#fff2b0" };
+      if(!DATA.seasonFrames.some(f=>f.season===DATA.season)) DATA.seasonFrames.push(newFrame);
+      persistData();
+      broadcastAll({ type:"seasonUpdate", season: DATA.season, seasonFrames: DATA.seasonFrames });
+      break;
+    }
+  }
+}
