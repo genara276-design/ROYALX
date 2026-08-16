@@ -98,8 +98,16 @@ wss.on("connection", (ws)=>{
     if(msg.type==="hello"){
       if(!msg.id || !msg.name) return;
       if(DATA.banned.includes(msg.id)){ send(ws, { type:"banned", reason:"Banned" }); ws.close(); return; }
-      me = { ws, id: msg.id, name: String(msg.name).slice(0,16), room:null, isAdmin:false };
+      // reconnecting mid-match: if we still have this player's old entry
+      // (kept alive during its grace period after a disconnect), inherit
+      // their room so a brief network drop doesn't knock them into a
+      // different match than their squadmates
+      const prev = clientsById.get(msg.id);
+      if(prev && prev._graceTimer){ clearTimeout(prev._graceTimer); }
+      me = { ws, id: msg.id, name: String(msg.name).slice(0,16), room: (prev ? prev.room : null), isAdmin:false };
       clientsById.set(me.id, me);
+      if(me.room && !rooms.has(me.room)) me.room = null; // room ended while we were gone
+      else if(me.room){ rooms.get(me.room).players.add(me.id); }
       send(ws, friendsUpdatePayload(me.id));
       send(ws, { type:"chatHistory", messages: chatHistory });
       send(ws, { type:"seasonUpdate", season: DATA.season, seasonFrames: DATA.seasonFrames });
@@ -277,14 +285,14 @@ wss.on("connection", (ws)=>{
 // rest of the 60-player lobby with local NPCs (existing client design).
 // ---------------------------------------------------------------------
 const MATCH_MAX_REAL = 8;
-const MATCH_MAX_WAIT_MS = 12000;
+const MATCH_MAX_WAIT_MS = 15000; // always let the queue sit ~15s before forming a match, even if people are already waiting — keeps matchmaking feeling real instead of instant
 let queueOpenedAt = null;
 
 function tryFormMatch(){
   if(queue.length===0) return;
   if(queueOpenedAt===null) queueOpenedAt = Date.now();
   const waited = Date.now()-queueOpenedAt;
-  if(queue.length < 2 && waited < MATCH_MAX_WAIT_MS) return; // give a couple seconds for others to join
+  if(waited < MATCH_MAX_WAIT_MS) return;
 
   // squad-aware grouping: pull whole squads out together
   const batch = [];
