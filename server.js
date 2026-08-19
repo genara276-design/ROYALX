@@ -324,10 +324,58 @@ wss.on("connection", (ws) => {
       }
       if (msg.type === "adminBroadcast") { broadcastAll({ type: "announcement", text: msg.text || "" }); send(myId, { type: "adminActionResult", ok: true, msg: "Elan göndərildi." }); return; }
       if (msg.type === "adminEventWarning") { eventWarningText = msg.text || ""; broadcastAll({ type: "eventWarning", text: eventWarningText }); send(myId, { type: "adminActionResult", ok: true, msg: "Yeniləndi." }); return; }
-      // Digər admin əməliyyatları (zombieForce, weatherTrigger, marketOverride/Sale/Toggle,
-      // endSeason/newSeason, chestSkinAdd/Remove) — bu funksiyalar hələ bütün oyunçulara
-      // sinxronlaşdırılmır, yalnız admin tərəfdə təsdiq olunur.
-      send(myId, { type: "adminActionResult", ok: true, msg: "Qeydə alındı (hələ tam sinxron deyil)." });
+      if (msg.type === "adminZombieForce") {
+        broadcastAll({ type: "zombieEventUpdate", forceNext: msg.action === "start" }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Zombi hadisəsi bütün oyunçulara sinxronlaşdırıldı." });
+        return;
+      }
+      if (msg.type === "adminWeatherTrigger") {
+        broadcastAll({ type: "weatherUpdate", weatherType: msg.weatherType, seconds: msg.seconds }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Hava effekti bütün oyunçulara göndərildi." });
+        return;
+      }
+      if (msg.type === "adminMarketOverride") {
+        const o = Object.assign({}, priceOverrides[msg.mid], { price: msg.price, discountPrice: msg.discountPrice });
+        priceOverrides[msg.mid] = o;
+        broadcastAll({ type: "marketOverrideUpdate", mid: msg.mid, override: o }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Qiymət bütün oyunçulara sinxronlaşdırıldı." });
+        return;
+      }
+      if (msg.type === "adminMarketSale") {
+        const o = Object.assign({}, priceOverrides[msg.mid], { saleEndsAt: Date.now() + (msg.minutes || 0) * 60000 });
+        priceOverrides[msg.mid] = o;
+        broadcastAll({ type: "marketOverrideUpdate", mid: msg.mid, override: o }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Kampaniya bütün oyunçulara sinxronlaşdırıldı." });
+        return;
+      }
+      if (msg.type === "adminMarketToggle") {
+        const o = Object.assign({}, priceOverrides[msg.mid], { enabled: msg.enabled });
+        priceOverrides[msg.mid] = o;
+        broadcastAll({ type: "marketOverrideUpdate", mid: msg.mid, override: o }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Market vəziyyəti sinxronlaşdırıldı." });
+        return;
+      }
+      if (msg.type === "adminChestSkinAdd") {
+        broadcastAll({ type: "chestSkinUpdate", action: "add", skinId: msg.skinId }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Skin bütün oyunçuların sandığına əlavə olundu." });
+        return;
+      }
+      if (msg.type === "adminChestSkinRemove") {
+        broadcastAll({ type: "chestSkinUpdate", action: "remove", skinId: msg.skinId }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Skin sandıqdan bütün oyunçular üçün silindi." });
+        return;
+      }
+      if (msg.type === "adminNewSeason") {
+        broadcastAll({ type: "seasonUpdate", season: msg.season, seasonFrames: msg.seasonFrames }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Yeni sezon bütün oyunçulara elan olundu." });
+        return;
+      }
+      if (msg.type === "adminEndSeason") {
+        broadcastAll({ type: "announcement", text: "🏆 Sezon " + msg.season + " bitdi! Yeni sezon tezliklə." }, myId);
+        send(myId, { type: "adminActionResult", ok: true, msg: "Sezon sonu bütün oyunçulara elan olundu." });
+        return;
+      }
+      send(myId, { type: "adminActionResult", ok: true, msg: "Qeydə alındı." });
       return;
     }
   });
@@ -350,4 +398,3 @@ wss.on("connection", (ws) => {
 });
 
 server.listen(PORT, () => console.log(`🚀 Server ${PORT} portunda MongoDB-siz aktivdir`));
-
