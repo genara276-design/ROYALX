@@ -92,9 +92,28 @@ function topLeaderboard() {
   return Array.from(leaderboard.values()).sort((a, b) => b.rankPoints - a.rankPoints).slice(0, 50);
 }
 
+function currentQueueRealCount() {
+  const ids = new Set();
+  queue.forEach(entry => {
+    if (players.has(entry.id)) ids.add(entry.id);
+    (entry.squad || []).forEach(sid => { if (players.has(sid)) ids.add(sid); });
+  });
+  return ids.size;
+}
+function broadcastQueueUpdate() {
+  const realPlayers = currentQueueRealCount();
+  const ids = new Set();
+  queue.forEach(entry => { ids.add(entry.id); (entry.squad || []).forEach(sid => ids.add(sid)); });
+  ids.forEach(id => send(id, { type: "queueUpdate", realPlayers, target: 100 }));
+}
+
 /* =========================================================================
-   MATÇMEYKİNQ — hər 14 saniyədə sıranı bir otaqda birləşdirir
+   MATÇMEYKİNQ — hər 15 saniyədə sıranı bir otaqda birləşdirir (client-in
+   göstərdiyi 15s geri sayımla üst-üstə düşür); sırada olanlara hər 2
+   saniyədən bir "neçə real oyunçu tapıldı" məlumatını göndərir ki, ekranda
+   real oyunçu sayı görünsün — əvvəllər bu mesaj heç göndərilmirdi.
    ========================================================================= */
+setInterval(broadcastQueueUpdate, 2000);
 setInterval(() => {
   if (queue.length === 0) return;
   const roomId = newRoomId();
@@ -113,7 +132,7 @@ setInterval(() => {
     send(id, { type: "matchStart", roomId, players: playerList, npcCount });
   });
   queue.length = 0;
-}, 14000);
+}, 15000);
 
 /* =========================================================================
    BAĞLANTI
@@ -225,11 +244,13 @@ wss.on("connection", (ws) => {
     /* ---------------- MATÇMEYKİNQ ---------------- */
     if (msg.type === "queue") {
       if (!queue.some(e => e.id === myId)) queue.push({ id: myId, squad: msg.squad || [] });
+      broadcastQueueUpdate();
       return;
     }
     if (msg.type === "leaveQueue") {
       const idx = queue.findIndex(e => e.id === myId);
       if (idx >= 0) queue.splice(idx, 1);
+      broadcastQueueUpdate();
       return;
     }
 
@@ -392,7 +413,7 @@ wss.on("connection", (ws) => {
     }
     players.delete(myId);
     const qIdx = queue.findIndex(e => e.id === myId);
-    if (qIdx >= 0) queue.splice(qIdx, 1);
+    if (qIdx >= 0) { queue.splice(qIdx, 1); broadcastQueueUpdate(); }
     console.log("❌ Oyunçu ayrıldı: " + myId);
   });
 });
